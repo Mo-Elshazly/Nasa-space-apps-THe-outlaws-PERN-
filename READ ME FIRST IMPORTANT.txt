@@ -1,0 +1,5 @@
+These are the projects files they consist of:
+1-The website we made
+2-The code for the website we made
+3-Pictures for our hardware project
+4-The ESP code for the hardware 

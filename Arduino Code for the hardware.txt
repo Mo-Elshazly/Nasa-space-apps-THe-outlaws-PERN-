@@ -1,0 +1,164 @@
+/*
+ * ============================================================
+ *  COMPLETE ENVIRONMENTAL & WATER QUALITY STATION (v7.0 - Online)
+ *  Sensors: DHT22 + MQ135 + TDS + pH + Dust Sensor (GPIO 39 / VN)
+ *  Connectivity: WiFi + MQTT (EMQX) + HTTP POST (ngrok backend)
+ * ============================================================
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <DHT.h>
+#include <math.h>
+
+// ============================================================
+// WI-FI SETTINGS
+// ============================================================
+const char* ssid     = "Nazeer2025";
+const char* password = "Nm1980@Wy1980@";
+
+WebServer server(80);
+
+// ============================================================
+// MQTT SETTINGS (EMQX Broker)
+// ============================================================
+const char* mqtt_server = "broker.emqx.io";
+const int   mqtt_port   = 1883;
+const char* device_id   = "pern_1";
+
+String mqttClientId;
+String topicData;
+String topicStatus;
+
+WiFiClient   espClient;
+PubSubClient mqttClient(espClient);
+
+// ============================================================
+// BACKEND (ngrok) SETTINGS
+// ============================================================
+const char* backend_base_url = "https://plating-obsession-blandness.ngrok-free.dev";
+String backend_endpoint = String(backend_base_url) + "/api/sensor-data";
+
+// ============================================================
+// REPORTING INTERVAL
+// ============================================================
+const unsigned long REPORT_INTERVAL_S = 30;
+unsigned long lastReportTime = 0;
+
+// ============================================================
+// PIN DEFINITIONS
+// ============================================================
+#define DHT_PIN          4
+#define DHT_TYPE         DHT22
+
+#define MQ135_PIN        34
+#define TDS_PIN          35
+#define PH_PIN           32
+
+#define DUST_ANALOG_PIN  39
+#define DUST_IR_PIN      18
+
+// ============================================================
+// GLOBAL VARIABLES FOR WEB SERVER
+// ============================================================
+float webTemp      = 0.0;
+float webHum       = 0.0;
+float webCO2       = 0.0;
+float webNH3       = 0.0;
+float webSmoke     = 0.0;
+float webTDS       = 0.0;
+float webPH        = 7.0;
+int   webDustRaw   = 0;
+float webDustVolt  = 0.0;
+bool  mq135Ready   = false;
+
+// ============================================================
+// SENSOR CONFIGURATIONS
+// ============================================================
+const int   DHT_OVERSAMPLE       = 3;
+const float DHT_EMA_ALPHA        = 0.2;
+const float DHT_SELF_HEAT_OFFSET = 0.5;
+
+const bool  MQ135_USE_STORED_R0   = false;
+const float MQ135_R0_CLEAN_AIR    = 10.0;
+const float MQ135_RL_KOHM         = 1.0;
+const float MQ135_RATIO_CLEAN_AIR = 3.6;
+const unsigned long MQ135_WARMUP_MS = 120000;
+
+const float MQ135_CO2_A = 116.6020682;
+const float MQ135_CO2_B = -2.769034857;
+const float MQ135_NH3_A = 102.2;
+const float MQ135_NH3_B = -2.473;
+const float MQ135_SMOKE_A = 110.47;
+const float MQ135_SMOKE_B = -2.862;
+const float CO2_ATMOSPHERIC_BASELINE = 400.0;
+const float MQ135_CORR_A =  0.00035;
+const float MQ135_CORR_B =  0.02718;
+const float MQ135_CORR_C =  0.0018;
+const float MQ135_CORR_D = -0.003333;
+
+const float TDS_VREF     = 3.3;
+const int   TDS_ADC_MAX  = 4095;
+const int   TDS_SAMPLES  = 30;
+float       TDS_K_CELL   = 1.0;
+const float TDS_TEMP_COEFF = 0.0191;
+
+float phCalibrationOffset = 0.0;
+
+const unsigned long CYCLE_INTERVAL_MS = 3000;
+unsigned long lastCycleTime = 0;
+unsigned long bootTime      = 0;
+
+DHT dht(DHT_PIN, DHT_TYPE);
+float emaTemperature  = NAN;
+float emaHumidity     = NAN;
+float mq135R0         = MQ135_R0_CLEAN_AIR;
+
+// ============================================================
+// FUNCTION PROTOTYPES
+// ============================================================
+bool dhtCollectSamples(float* outTemp, float* outHum);
+float dhtMedian(float* arr, int n);
+void dhtSort(float* arr, int n);
+float applyEMA(float prev, float newVal, float alpha);
+
+float mq135ReadRS();
+float mq135CorrectRS(float rs, float tempC, float humidity);
+float mq135CalibrateR0();
+float mq135ReadCO2(float r0, float tempC, float humidity);
+float mq135ReadNH3(float r0, float tempC, float humidity);
+float mq135ReadSmoke(float r0, float tempC, float humidity);
+
+float tdsReadFilteredVoltage();
+float tdsReadPPM(float tempC);
+
+void readDustSensor(int &outRaw, float &outVoltage);
+float readPHValue();
+
+void mqttReconnect();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+String buildJsonPayload();
+void publishMQTT(const String &jsonPayload);
+void sendHTTPPost(const String &jsonPayload);
+void handleRoot();
+
+// ============================================================
+// WEB SERVER HTML GENERATION
+// ============================================================
+void handleRoot() {
+  String html = "<!DOCTYPE html><html lang='en'><head>";
+  html += "<meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<title>Environmental & Water Monitoring Station</title>";
+  html += "<meta http-equiv='refresh' content='3'>";
+  html += "<style>";
+  html += "body { font-family: 'Segoe UI', Tahoma, sans-serif; background-color: #0f172a; color: #f8fafc; margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; }";
+  html += "h1 { color: #38bdf8; text-align: center; margin-bottom: 5px; }";
+  html += ".subtitle { color: #94a3b8; font-size: 0.9em; margin-bottom: 25px; }";
+  html += ".grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; width: 100%; max-width: 900px; }";
+  html += ".card { background: #1e293b; padding: 20px; border-radius: 16px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.3); text-align: center; border: 1px solid #334155; }";
+  html += ".card h2 { margin: 0; font-size: 1.1em; color: #94a3b8; }";
+  html += ".card p { font-size: 2.2em;
